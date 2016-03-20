@@ -2,7 +2,7 @@
 """jenkins-trigger-console.py
 
 Usage:
-    jenkins-trigger-console.py --job <jobname> [--url <url>] [--sleep <sleep_time>] [--encoding <type>] [--parameters <data>] [--wait-timer <time>] [--debug]
+    jenkins-trigger-console.py --job <jobname> [--url <url>] [--sleep <sleep_time>] [--encoding <type>] [--parameters <data>] [--wait-timer <time>] [--private-key <id_rsa>] [--ssh-agent] [--auth-user <user>] [--debug]
     jenkins-trigger-console.py -h
 
 Examples:
@@ -11,6 +11,9 @@ Examples:
 Options:
   -j, --job <jobname>               Job name.
   -u, --url <url>                   Jenkins URL [default: http://localhost:8080]
+  -i, --private-key <id_rsa>        Sign the date header with private key.
+  -t, --ssh-agent                   Sign the date header with ssh-agent.
+  -a, --auth-user <user>            User and org to send as header [default: '/default/keys/$USER']
   -s, --sleep <sleep_time>          Sleep time between polling requests [default: 2]
   -w, --wait-timer <time>           Wait time in queue [default: 100]
   -e, --encoding <type>             Encoding type supports text or html [default: html]
@@ -22,7 +25,7 @@ Options:
 import requests
 from docopt import docopt
 from time import sleep
-
+from http_signature.requests_auth import HTTPSignatureAuth
 
 class Trigger():
     def __init__(self, arguments):
@@ -32,15 +35,27 @@ class Trigger():
             print "argument = ", arguments
         self.url = arguments['--url']
         self.job = arguments['--job']
+        self.debug = arguments['--debug']
         self.timer = int(arguments['--wait-timer'])
         self.sleep = int(arguments['--sleep'])
         self.encoding = arguments['--encoding']
-        self.debug = arguments['--debug']
+
+        ## Sign auth section
+        self.key = arguments['--private-key']
+        self.agent = arguments['--ssh-agent']
+
+        if arguments['--auth-user'] == "/default/keys/$USER":
+            import getpass
+            self.auth_user = "/default/keys/" + getpass.getuser()
+        else:
+            self.auth_user = arguments['--auth-user']
+
         if self.encoding.lower() in ["html", "text"]:
             self.encoding = self.encoding.title()
         else:
             print " '%s' is not a valid encoding only support 'text', 'html'" % self.encoding 
             exit(1)
+        
         if arguments['--parameters']:
             try:
                 self.parameters = dict(u.split("=") for u in arguments['--parameters'].split(","))
@@ -50,17 +65,34 @@ class Trigger():
         else:
             self.parameters = False
 
+    def sign_header(self):
+        #self.auth_user = "/use_test/keys/user_test2"
+        if self.key:
+            try:
+                auth = HTTPSignatureAuth(key_id=self.auth_user, secret=self.key)
+            except IOError as E:
+                print "Error signing '%s' : %s" % (self.key, E)
+                exit(1)
+            except ValueError as E:
+                print "SSH '%s' : %s" % (self.key, E)
+                exit(1)
+            return auth
+        elif self.agent:
+            auth = HTTPSignatureAuth(key_id=self.auth_user, secret="", allow_agent=True)
+            #http_signature.Signer(secret='', algorithm='rsa-sha256', allow_agent=False)
+        else:
+            return None
+
     def trigger_build(self):
-        
         # Do a build request
         if self.parameters:
             build_url = self.url + "/job/" + self.job + "/buildWithParameters"
             print "Triggering a build via post @ ", build_url
-            build_request = requests.post(build_url,data=self.parameters)
+            build_request = requests.post(build_url, data=self.parameters, auth=self.sign_header())
         else:
             build_url = self.url + "/job/" + self.job + "/build"
             print "Triggering a build via get @ ", build_url
-            build_request = requests.get(build_url)
+            build_request = requests.get(build_url, auth=self.sign_header())
         
         if build_request.status_code == 201:
             queue_url =  build_request.headers['location'] +  "/api/json"
@@ -80,7 +112,7 @@ class Trigger():
 
         waiting_for_job = True 
         while waiting_for_job:
-            queue_request = requests.get(queue_url)
+            queue_request = requests.get(queue_url, auth=self.sign_header())
             if queue_request.json().get("why") != None:
                 print " . Waiting for job to start because :", queue_request.json().get("why")
                 timer -= 1
@@ -106,7 +138,7 @@ class Trigger():
 
         console_requests = requests.session()
         while stream_open:
-            console_response = console_requests.post(job_url, data={'start': start_at })
+            console_response = console_requests.post(job_url, data={'start': start_at }, auth=self.sign_header())
             content_length = int(console_response.headers.get("Content-Length",-1))
 
             if console_response.status_code != 200:
@@ -128,7 +160,7 @@ class Trigger():
             # No content for a while lets check if job is still running
             if check_job_status > 1:
                 job_status_url = self.url + "/job/" + self.job + "/" + str(job_number) + "/api/json"
-                job_requests = requests.get(job_status_url)
+                job_requests = requests.get(job_status_url, auth=self.sign_header())
                 job_bulding= job_requests.json().get("building")
                 if not job_bulding:
                     # We are done
